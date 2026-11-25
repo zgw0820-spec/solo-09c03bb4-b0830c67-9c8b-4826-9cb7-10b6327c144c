@@ -47,6 +47,8 @@
   <a class="btn btn-secondary" href="{{ url_for('index') }}">← 返回重新上传</a>
 </section>
 
+{% include "_window_panel.html" %}
+
 {% else %}
 {% set m = outcome.meta %}
 {% set s = outcome.summary %}
@@ -79,6 +81,8 @@
   </a>
   {% endfor %}
 </section>
+
+{% include "_window_panel.html" %}
 
 <section class="card table-card">
   <div class="table-toolbar">

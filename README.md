@@ -19,6 +19,48 @@
 和十六进制偏移（首尾采用含尾写法，另在数据属性中给出半开区间 `[start,end)`），
 支持按分类筛选与分页。
 
+## 「接收窗口耗尽」检查
+
+结果页额外基于**发端抓包**逐帧回放「发起方没有额度发送新数据」的时段，供值班员
+排查专线吞吐下降/发送停顿。它不依赖收端文件。
+
+**适用条件（不满足时面板逐条说明原因，不硬给结论）：**
+
+- 发端文件是**未截断**的**经典 PCAP** + **Ethernet**（`DLT_EN10MB=1`，支持 VLAN）；
+  PCAPNG、其它 linktype、snaplen/记录截断均判为不适用；
+- 三次握手完整（SYN → SYN-ACK → ACK，序号/确认号匹配）且三个握手包都不带载荷；
+- 全文件时间戳单调不减（不回拨，相等允许）；
+- **双向**序号跨度都严格小于 2 GiB，因此 32 位序号可无歧义展开并支持回绕。
+
+**回放算法（`pcapdiff/window_check.py`）：**
+
+- 从握手完成帧开始按帧序回放；以 **SYN-ACK 窗口原值**作为 `SND.WND` 初值
+  （SYN 段窗口永不缩放）；只有 SYN 与 SYN-ACK **双方都带 Window Scale 选项**时，
+  握手后的窗口通告才按 SYN-ACK 中的 shift 换算；
+- 累计确认按 RFC 9293 的可接受范围 `SND.UNA < SEG.ACK ≤ SND.NXT` 更新；
+  窗宽更新还要满足 `SND.UNA ≤ SEG.ACK ≤ SND.NXT` 且通过
+  `SND.WL1 < SEG.SEQ` 或 `SND.WL1 = SEG.SEQ 且 SND.WL2 ≤ SEG.ACK`；
+- 新发额度：`quota = SND.UNA + 有效 SND.WND − 已发数据最远右沿`
+  （SYN 相对坐标，等价于「累计 ACK + 窗宽 − 已发最远字节尾」）；
+  重传旧字节不推进最远右沿，因此不会重复占额度；
+- `quota ≤ 0` 即耗尽，并细分为 **零窗口**（有效窗宽为 0）与 **非零满窗**
+  （窗宽 > 0 但在途字节填满窗口）。相邻同类合并，类型切换帧同时作为上一段的
+  结束帧与下一段的起始帧；
+- 每段列出类型、**起止帧号**、**耗时**（起止帧时间戳之差，同时给秒/毫秒）、
+  额度与窗宽变化、恢复情况；在第一个 **FIN**、**RST** 或**抓包结束**时仍处于
+  耗尽状态的尾段标记为 **「未见恢复」**。
+
+耗尽段落在分析时一次性落入 SQLite `win_episode` 表，结果页用 `wpage/wsize/wkind`
+独立分页，翻页只查库、**不重读抓包**；回放本身只有标量状态 + 1000 行批量写缓冲，
+Python 内存不随包数或耗尽段数增长。
+
+接口：`GET /api/r/<run_id>/windows?wpage=&wsize=&wkind=zero|full`；
+主结果 JSON `/api/r/<run_id>` 也附带 `window`（判定摘要）与 `window_page`（当前页）。
+
+新增内置样例 <http://localhost:5000/sample/window>：原始窗口 100，依次演示
+「满窗 300 ms 后恢复 → 满窗切换零窗口、1.0 s 后窗口打开 → 末尾满窗到抓包结束、
+未见恢复」，其中夹注重传旧字节。
+
 ## 校验规则（两份都通过后才出结果）
 
 - 可解析的经典 PCAP（微秒/纳秒魔数、大小端）或 PCAPNG（SHB/IDB/EPB/SPB）；
@@ -65,7 +107,9 @@ python app.py                 # 或 python wsgi.py，默认 0.0.0.0:5000
 首页点击「使用内置样例一键试跑」，或直接访问：
 
 - <http://localhost:5000/sample/basic> — 1000 字节，三类齐全，含重传与不同分段；
-- <http://localhost:5000/sample/wrap> — ISN 接近 `2^32`，数据流跨越序号回绕。
+- <http://localhost:5000/sample/wrap> — ISN 接近 `2^32`，数据流跨越序号回绕；
+- <http://localhost:5000/sample/window> — 接收窗口耗尽专样：满窗、零窗口、
+  类型切换、重传不占额度与「未见恢复」尾段。
 
 也可用 `python tools/make_samples.py` 在 `samples/` 下生成样例 PCAP 供手工上传。
 
@@ -85,8 +129,9 @@ basic 样例的预期结果：
 | `POST /`、`/analyze`、`/upload`、`/compare` | multipart 上传两份 PCAP，默认返回 HTML；`Accept: application/json` 或 `?format=json` 返回 JSON |
 | `POST /api/analyze` | 纯 JSON 分析接口 |
 | `GET /r/<run_id>`（别名 `/result/<id>`、`/results/<id>`） | 结果分页页 |
-| `GET /api/r/<run_id>` | 结果 JSON，参数 `page`/`p`、`size`/`page_size`/`per_page`/`limit`、`cat`/`category`（`captured`/`acked_only`/`missing`，也接受中文） |
-| `GET /sample/<basic\|wrap>` | 内置样例；加 `?format=json` 返回 JSON |
+| `GET /api/r/<run_id>` | 结果 JSON，参数 `page`/`p`、`size`/`page_size`/`per_page`/`limit`、`cat`/`category`（`captured`/`acked_only`/`missing`，也接受中文）；附带 `window` 与 `window_page` |
+| `GET /api/r/<run_id>/windows` | 接收窗口耗尽分段 JSON，参数 `wpage`/`wp`、`wsize`、`wkind=zero\|full` |
+| `GET /sample/<basic\|wrap\|window>` | 内置样例；加 `?format=json` 返回 JSON |
 | `GET /healthz` | 健康检查 |
 
 文件字段名兼容 `sender`/`receiver`、`file1`/`file2`、任意两个按顺序的文件部分、
@@ -123,12 +168,13 @@ pcapdiff/
   pcap_reader.py       # 流式 PCAP/PCAPNG 读取
   packet_codec.py      # Ethernet/VLAN/IPv4/TCP 解码 + 序号模差
   scanner.py           # 第一遍校验/SYN，第二遍区间与 ACK 提取
-  engine.py            # SQLite 区间并集、三分类、分页查询、编排
+  window_check.py      # 发端接收窗口耗尽逐帧回放（零窗口/满窗分段）
+  engine.py            # SQLite 区间并集、三分类、窗口分段、分页查询、编排
   app.py               # Flask 路由
-  sample_data.py       # 两个内置样例
-  pcap_writer.py       # 零依赖 PCAP/PCAPNG 构造（样例与测试用）
+  sample_data.py       # 三个内置样例（basic/wrap/window）
+  pcap_writer.py       # 零依赖 PCAP/PCAPNG 构造（样例与测试用，支持自定义时间戳/窗口/选项）
   templates/ static/
-tests/                 # 40 个 pytest 用例
+tests/                 # 64 个 pytest 用例（含 test_window.py 24 个窗口检查用例）
 tools/                 # 样例生成、内存自测脚本
 Dockerfile docker-compose.yml requirements.txt
 ```
@@ -137,7 +183,7 @@ Dockerfile docker-compose.yml requirements.txt
 
 ```bash
 python3 -m pip install -r requirements.txt pytest
-python3 -m pytest tests/          # 40 passed
+python3 -m pytest tests/          # 64 passed
 python3 tools/selftest_memory.py  # 内存恒定性
 ```
 
@@ -145,6 +191,12 @@ python3 tools/selftest_memory.py  # 内存恒定性
 PCAPNG（自带 writer 与 Scapy 生成文件互通）、TCP 选项/VLAN、缺 SYN、IP 分片
 （MF 与片偏移）、四元组/ISN 不一致、垃圾文件/截断头、非 Ethernet、2 GiB
 边界三种序号构造、分页/分类筛选/JSON API/字段名兼容等。
+
+窗口检查另覆盖：满窗恢复耗时、重传不重启/不占额度、初始零窗口与重复 ACK 窗更、
+满窗↔零窗口切换、双方/单方 Window Scale、序号回绕、FIN/RST/抓包结束的
+「未见恢复」、PCAPNG/非 Ethernet/记录截断/握手缺失/握手带载荷/时间戳回拨/
+双向 2 GiB 跨度等不适用原因，以及落库分页与 Web/JSON 渲染。20 万个「耗尽→恢复」
+分段（40 万帧）在独立分析子进程中峰值 RSS 约 19 MiB，不随分段数增长。
 
 ## 限制与未完成项
 

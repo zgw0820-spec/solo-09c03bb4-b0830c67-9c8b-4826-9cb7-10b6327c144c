@@ -54,6 +54,8 @@ class TcpSegment:
     declared_payload_len: int  # bytes the IP/TCP headers claim
     truncated: bool
     fragmented: bool = False  # IPv4 fragment (such frames carry no TCP info)
+    window: int = 0           # raw 16-bit advertised window (pre scaling)
+    wscale: Optional[int] = None  # RFC 7323 Window Scale shift (kind=3), if present
 
 
 @dataclass(frozen=True)
@@ -168,10 +170,30 @@ def decode_frame(frame_no: int, data: bytes,
         data_byte = data[l4_off + 12]
         data_off = (data_byte >> 4) * 4
         flags = data[l4_off + 13]
+        raw_window = struct.unpack_from("!H", data, l4_off + 14)[0]
         if data_off < 20:
             return FrameDecode(frame_no, None, malformed=True)
         if len(data) < l4_off + data_off:
             return FrameDecode(frame_no, None, malformed=True)
+
+        # Parse only the Window Scale option (kind=3, len=3).  Option parsing
+        # is bounds-checked and never raises on malformed options.
+        wscale: Optional[int] = None
+        opt_end = l4_off + data_off
+        i = l4_off + 20
+        while i + 1 < opt_end:
+            kind = data[i]
+            if kind == 0:          # End of option list
+                break
+            if kind == 1:          # NOP
+                i += 1
+                continue
+            opt_len = data[i + 1]
+            if opt_len < 2 or i + opt_len > opt_end:
+                break
+            if kind == 3 and opt_len == 3:
+                wscale = data[i + 2]
+            i += opt_len
 
         # Payload length as declared by IP / TCP headers.
         if total_len >= ihl:
@@ -202,6 +224,8 @@ def decode_frame(frame_no: int, data: bytes,
             payload_len=payload_len,
             declared_payload_len=declared_len,
             truncated=truncated,
+            window=raw_window,
+            wscale=wscale,
         )
         return FrameDecode(frame_no, seg)
     except (struct.error, IndexError):

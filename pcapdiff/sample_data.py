@@ -139,7 +139,22 @@ WRAP = SampleSpec(
     ),
 )
 
-SAMPLES = {s.key: s for s in (BASIC, WRAP)}
+WINDOW = SampleSpec(
+    key="window",
+    title="接收窗口耗尽样例：满窗 → 零窗口 → 未见恢复",
+    description=(
+        "发端抓包内回放窗口状态：SYN-ACK 原始窗口 100，先出现一段 300 ms "
+        "的非零满窗并被 ACK 恢复；随后满窗切换为零窗口，1.0 s 后窗口更新"
+        "恢复；末尾再次满窗直到抓包结束，标记为未见恢复。含重传旧字节，"
+        "验证重传不重复占额度。"
+    ),
+    isn=1000,
+    total_bytes=960,
+    expected=(),
+)
+
+SAMPLES = {s.key: s for s in (BASIC, WRAP, WINDOW)}
+
 
 
 def build_sample(spec_key: str, out_dir: str) -> tuple[str, str, SampleSpec]:
@@ -183,6 +198,80 @@ def build_sample(spec_key: str, out_dir: str) -> tuple[str, str, SampleSpec]:
             receiver_frames.append(_data(off, length, isn))
         for acked in (80, 200, 220):
             receiver_frames.append(_ack(acked, isn))
+
+    elif spec_key == "window":
+        # Deterministic window-exhaustion scenario.  Items are
+        # (ethernet_frame, epoch_seconds) so durations are exact.  The same
+        # frames are used for both "ends" -> the byte comparison is trivially
+        # green; the point of this sample is the window replay.
+        sisn = 7777
+        t0 = 1_700_000_000.0
+
+        def ts(sec: float) -> float:
+            return t0 + sec
+
+        w_syn = build_tcp_packet(
+            src_ip=CLIENT, src_port=CLIENT_PORT,
+            dst_ip=SERVER, dst_port=SERVER_PORT,
+            seq=isn, flags=TCP_SYN,
+        )
+        w_synack = build_tcp_packet(
+            src_ip=SERVER, src_port=SERVER_PORT,
+            dst_ip=CLIENT, dst_port=CLIENT_PORT,
+            seq=sisn, ack=(isn + 1) & 0xFFFFFFFF,
+            flags=TCP_SYN | TCP_ACK, window=100,
+        )
+        w_hsack = build_tcp_packet(
+            src_ip=CLIENT, src_port=CLIENT_PORT,
+            dst_ip=SERVER, dst_port=SERVER_PORT,
+            seq=(isn + 1) & 0xFFFFFFFF, ack=(sisn + 1) & 0xFFFFFFFF,
+            flags=TCP_ACK,
+        )
+
+        def w_data(off: int, length: int) -> bytes:
+            return build_tcp_packet(
+                src_ip=CLIENT, src_port=CLIENT_PORT,
+                dst_ip=SERVER, dst_port=SERVER_PORT,
+                seq=_seq(isn, off), ack=sisn + 1,
+                flags=TCP_ACK | 0x08,
+                payload=_payload(off // max(length, 1), length),
+            )
+
+        def w_ack(acked_off: int, window: int) -> bytes:
+            return build_tcp_packet(
+                src_ip=SERVER, src_port=SERVER_PORT,
+                dst_ip=CLIENT, dst_port=CLIENT_PORT,
+                seq=sisn + 1, ack=_ack_for_offset(isn, acked_off),
+                flags=TCP_ACK, window=window,
+            )
+
+        w_tail_ack = build_tcp_packet(
+            src_ip=CLIENT, src_port=CLIENT_PORT,
+            dst_ip=SERVER, dst_port=SERVER_PORT,
+            seq=_seq(isn, 960), ack=sisn + 1, flags=TCP_ACK,
+        )
+
+        sender_frames = [
+            (w_syn, ts(0.00)),                                  # 1
+            (w_synack, ts(0.01)),                               # 2 win=100
+            (w_hsack, ts(0.02)),                                # 3
+            (w_data(0, 60), ts(0.10)),                          # 4
+            (w_data(60, 40), ts(0.20)),                         # 5 fills win
+            (w_data(0, 60), ts(0.30)),                          # 6 retransmit
+            (w_ack(60, 100), ts(0.50)),                         # 7 recovers
+            (w_data(100, 60), ts(0.60)),                        # 8 fills again
+            (w_data(60, 40), ts(0.70)),                         # 9 retransmit
+            (w_ack(100, 60), ts(0.80)),                         # 10 shrinks, still full
+            (w_ack(100, 0), ts(1.00)),                          # 11 zero window
+            (w_ack(160, 0), ts(1.40)),                          # 12 ACK all, still 0
+            (w_ack(160, 800), ts(2.00)),                        # 13 window opens
+            (w_data(160, 400), ts(2.20)),                       # 14
+            (w_data(560, 400), ts(2.40)),                       # 15 fills 800
+            (w_data(560, 400), ts(2.70)),                       # 16 retransmit
+            (w_tail_ack, ts(3.00)),                             # 17 capture end
+        ]
+        receiver_frames = list(sender_frames)
+
     else:
         raise KeyError(spec_key)
 

@@ -33,6 +33,7 @@ class Frame:
     index: int          # 1-based frame number
     data: bytes         # captured link-layer bytes (truncated to incl_len)
     orig_len: int       # original wire length as recorded by the dumper
+    ts_ns: int = 0      # capture timestamp as epoch nanoseconds (0 if unknown)
 
 
 @dataclass
@@ -41,6 +42,7 @@ class PcapInfo:
     linktype: int
     snaplen: int
     frame_count: int = 0
+    classic: bool = True   # classic libpcap format (False -> pcapng)
 
 
 class PcapReader:
@@ -123,16 +125,19 @@ class PcapReader:
             )
         except struct.error as exc:
             raise PcapFormatError("PCAP 全局头解析失败") from exc
+        self._nano = nano
         self.info = PcapInfo(
             format_name="PCAP" + ("(纳秒)" if nano else ""),
             linktype=linktype,
             snaplen=snaplen,
+            classic=True,
         )
         self._iter_impl = self._iter_classic
 
     def _iter_classic(self) -> Iterator[Frame]:
         e = self._endian
         f = self._f
+        nano = getattr(self, "_nano", False)
         while True:
             hdr = f.read(16)
             if not hdr:
@@ -147,7 +152,11 @@ class PcapReader:
                 )
             data = self._read_exact(incl_len, "数据包内容") if incl_len else b""
             self._frame_index += 1
-            yield Frame(self._frame_index, data, orig_len)
+            if nano:
+                ts_ns = ts_sec * 1_000_000_000 + ts_frac
+            else:
+                ts_ns = ts_sec * 1_000_000_000 + ts_frac * 1_000
+            yield Frame(self._frame_index, data, orig_len, ts_ns)
 
     # -- pcapng ----------------------------------------------------------
     def _init_pcapng(self) -> None:
@@ -199,7 +208,8 @@ class PcapReader:
         self._f.close()
         self._f = open(self.path, "rb", buffering=1 << 20)
         self._f.seek(0)
-        self.info = PcapInfo(format_name="PCAPNG", linktype=linktype, snaplen=snaplen)
+        self.info = PcapInfo(format_name="PCAPNG", linktype=linktype,
+                             snaplen=snaplen, classic=False)
         self._iter_impl = self._iter_pcapng
 
     def _iter_pcapng(self) -> Iterator[Frame]:
@@ -223,14 +233,19 @@ class PcapReader:
             if btype == 6:  # Enhanced Packet Block
                 if len(body) < 20:
                     raise PcapFormatError("PCAPNG EPB 过短")
-                (_iface, _ts_hi, _ts_lo, caplen, origlen) = struct.unpack(
+                (_iface, ts_hi, ts_lo, caplen, origlen) = struct.unpack(
                     e + "IIIII", body[:20]
                 )
                 pkt = body[20:20 + caplen]
                 if len(pkt) < caplen:
                     raise PcapFormatError("PCAPNG EPB 数据包被截断")
+                # Default IDB timestamp resolution is microseconds; the
+                # window check itself requires classic PCAP, so this is only
+                # used for generic frame metadata.
+                ts_units = (ts_hi << 32) | ts_lo
+                ts_ns = ts_units * 1000
                 self._frame_index += 1
-                yield Frame(self._frame_index, pkt, origlen)
+                yield Frame(self._frame_index, pkt, origlen, ts_ns)
 
             elif btype == 3:  # Simple Packet Block
                 if len(body) < 4:

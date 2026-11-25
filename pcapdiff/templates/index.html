@@ -76,6 +76,13 @@
     校验要求：Ethernet 封装（DLT_EN10MB）的经典 PCAP 或 PCAPNG；两份均含同一连接、
     同一 ISN 的起始 SYN（SYN=1, ACK=0）；无任何 IPv4 分片；发起方数据跨度严格小于 2 GiB。
   </p>
+  <p class="form-hint">
+    比对结果页还会基于<strong>发端抓包</strong>逐帧回放
+    「<strong>接收窗口耗尽</strong>」时段（零窗口 / 非零满窗、起止帧号与耗时、
+    是否未见恢复）。该附加检查要求未截断的经典 Ethernet PCAP、三次握手完整且不带载荷、
+    时间戳不回拨、双向序号跨度 &lt; 2 GiB；不满足时会在结果页说明原因。
+    可直接试跑新增的「接收窗口耗尽样例」。
+  </p>
 </section>
 
 {% endblock %}

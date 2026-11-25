@@ -1,0 +1,210 @@
+{# 接收窗口耗尽检查面板。依赖上下文：outcome、window_page（可为 None）。 #}
+{% macro window_page_url(run_id, p, size, kind) -%}
+/r/{{ run_id }}?wpage={{ p }}&wsize={{ size }}{% if kind %}&wkind={{ kind }}{% endif %}#window-panel
+{%- endmacro %}
+
+<section class="card window-card" id="window-panel"
+         data-testid="window-panel" data-applicable="{{ '1' if (outcome.window and outcome.window.applicable) else '0' }}">
+  <div class="table-toolbar">
+    <h2>接收窗口耗尽检查
+      <span class="title-tag">发端无额度发送新数据的时段</span>
+    </h2>
+  </div>
+
+  {% set w = outcome.window %}
+  {% if not w %}
+    <div class="window-na" data-testid="window-unavailable">
+      本次运行没有生成接收窗口检查结果。
+    </div>
+
+  {% elif not w.applicable %}
+    <div class="window-na" data-testid="window-na">
+      <p class="window-na-title">⚠ 发端抓包不适用于接收窗口耗尽判定</p>
+      <ul class="window-na-reasons" data-testid="window-na-reasons">
+        {% for r in w.reasons %}
+          <li>{{ r }}</li>
+        {% else %}
+          <li>未知原因。</li>
+        {% endfor %}
+      </ul>
+      <p class="form-hint">
+        本检查要求：发端侧未截断的经典 Ethernet PCAP；三次握手完整且三个握手包
+        均不带载荷；全文件时间戳单调不回拨；双向序号跨度均严格小于 2 GiB。
+      </p>
+    </div>
+
+  {% else %}
+    <div class="win-stats" data-testid="window-stats">
+      <div class="win-stat">
+        <span class="meta-k">SYN-ACK 初始窗口（原值）</span>
+        <span class="meta-v" data-testid="window-initial-raw">
+          {{ w.initial_window_raw if w.initial_window_raw is not none else '—' }}
+        </span>
+      </div>
+      <div class="win-stat">
+        <span class="meta-k">窗口扩大（RFC 7323）</span>
+        <span class="meta-v" data-testid="window-wscale">
+          {% if w.wscale_negotiated %}
+            双方已协商 · 握手后通告 ×2^{{ w.window_shift }}
+          {% else %}
+            未双方协商 · 不换算
+          {% endif %}
+        </span>
+      </div>
+      <div class="win-stat">
+        <span class="meta-k">握手帧（SYN / SYN-ACK / ACK）</span>
+        <span class="meta-v">{{ w.syn_frame }} / {{ w.synack_frame }} / {{ w.handshake_ack_frame }}</span>
+      </div>
+      <div class="win-stat">
+        <span class="meta-k">握手完成起处理帧数</span>
+        <span class="meta-v">{{ '{:,}'.format(w.replayed_frames) }}</span>
+      </div>
+      <div class="win-stat win-stat-ep">
+        <span class="meta-k">耗尽分段（零窗口 / 满窗）</span>
+        <span class="meta-v">
+          <span data-testid="window-episode-count">{{ w.episode_count }}</span>
+          段 ·
+          <span class="kind-zero-text">零窗口 {{ w.zero_episodes }}</span> /
+          <span class="kind-full-text">满窗 {{ w.full_episodes }}</span>
+        </span>
+      </div>
+      <div class="win-stat {{ 'win-stat-bad' if w.unrecovered_episodes else 'win-stat-ok' }}">
+        <span class="meta-k">未见恢复</span>
+        <span class="meta-v" data-testid="window-unrecovered-count">
+          {{ w.unrecovered_episodes }} 段
+        </span>
+      </div>
+    </div>
+
+    {% if not window_page or window_page.total_episodes == 0 %}
+      <div class="window-ok" data-testid="window-empty">
+        ✅ 抓包适用：逐帧回放 {{ w.replayed_frames }} 帧后，未发现
+        「累计 ACK + 有效窗口 − 已发最远右沿 ≤ 0」的耗尽时段。
+      </div>
+    {% else %}
+      <div class="win-filter" data-testid="window-filter">
+        <a class="btn-mini {{ 'btn-mini-active' if not window_page.kind }}"
+           href="{{ window_page_url(outcome.run_id, 1, window_page.page_size, '') }}">全部 {{ w.episode_count }}</a>
+        <a class="btn-mini kind-zero-btn {{ 'btn-mini-active' if window_page.kind == 'zero' }}"
+           href="{{ window_page_url(outcome.run_id, 1, window_page.page_size, 'zero') }}">零窗口 {{ w.zero_episodes }}</a>
+        <a class="btn-mini kind-full-btn {{ 'btn-mini-active' if window_page.kind == 'full' }}"
+           href="{{ window_page_url(outcome.run_id, 1, window_page.page_size, 'full') }}">非零满窗 {{ w.full_episodes }}</a>
+      </div>
+
+      <div class="table-scroll">
+        <table class="seg-table win-table" data-testid="window-table">
+          <thead>
+            <tr>
+              <th class="col-idx">#</th>
+              <th>类型</th>
+              <th>起始帧</th>
+              <th>结束帧</th>
+              <th>持续耗时</th>
+              <th>新发额度（起→止）</th>
+              <th>通告窗宽（起→止）</th>
+              <th>结束 / 恢复情况</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for it in window_page['items'] %}
+            <tr class="window-row kind-row-{{ it.kind }} {{ 'row-unrecovered' if it.unrecovered else '' }}"
+                data-testid="window-row"
+                data-kind="{{ it.kind }}"
+                data-idx="{{ it.idx }}"
+                data-start-frame="{{ it.start_frame }}"
+                data-end-frame="{{ it.end_frame }}"
+                data-duration-ns="{{ it.duration_ns }}"
+                data-duration-sec="{{ it.duration_sec }}"
+                data-recovered="{{ '1' if it.recovered else '0' }}"
+                data-end-reason="{{ it.end_reason }}">
+              <td class="col-idx">{{ it.idx }}</td>
+              <td>
+                <span class="win-badge win-badge-{{ it.kind }}" data-testid="window-kind">
+                  {{ it.kind_label }}
+                </span>
+              </td>
+              <td class="win-frame" data-testid="window-start-frame">第 {{ it.start_frame }} 帧</td>
+              <td class="win-frame" data-testid="window-end-frame">第 {{ it.end_frame }} 帧</td>
+              <td class="win-duration" data-testid="window-duration">
+                <strong>{{ '%.3f'|format(it.duration_sec) }} 秒</strong>
+                <span class="dur-ms">（{{ ('%.3f'|format(it.duration_ms)).rstrip('0').rstrip('.') }} ms）</span>
+              </td>
+              <td class="win-quota {{ 'quota-neg' if it.end_quota <= 0 else 'quota-ok' }}">
+                {{ '{:,}'.format(it.start_quota) }} → {{ '{:,}'.format(it.end_quota) }}
+              </td>
+              <td class="win-wnd">
+                {{ '{:,}'.format(it.start_window) }} → {{ '{:,}'.format(it.end_window) }}
+              </td>
+              <td>
+                {% if it.end_reason == 'recovered' %}
+                  <span class="win-recovered" data-testid="window-recovered">✅ 已恢复：第 {{ it.end_frame }} 帧后额度 &gt; 0</span>
+                {% elif it.end_reason == 'switch' %}
+                  <span class="win-switch" data-testid="window-switch">↔ 第 {{ it.end_frame }} 帧切换为{{ '零窗口' if it.kind == 'full' else '非零满窗' }}</span>
+                {% elif it.end_reason == 'fin' %}
+                  <span class="win-norecovery" data-testid="window-no-recovery">🛑 首个 FIN（第 {{ it.end_frame }} 帧）时仍无额度，未见恢复</span>
+                {% elif it.end_reason == 'rst' %}
+                  <span class="win-norecovery" data-testid="window-no-recovery">🛑 首个 RST（第 {{ it.end_frame }} 帧）时仍无额度，未见恢复</span>
+                {% else %}
+                  <span class="win-norecovery" data-testid="window-no-recovery">⏱ 抓包结束（第 {{ it.end_frame }} 帧）仍无额度，未见恢复</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      {% if window_page.total_pages > 1 %}
+      <nav class="pagination" data-testid="window-pagination" aria-label="窗口分段分页">
+        {% if window_page.page > 1 %}
+          <a rel="prev" data-testid="window-page-prev"
+             href="{{ window_page_url(outcome.run_id, window_page.page - 1, window_page.page_size, window_page.kind) }}">上一页</a>
+        {% else %}
+          <span class="disabled">上一页</span>
+        {% endif %}
+        <span class="page-info" data-testid="window-page-info">
+          第 <strong>{{ window_page.page }}</strong> / {{ window_page.total_pages }} 页
+          · 共 {{ window_page.total_episodes }} 段
+        </span>
+        {% if window_page.page < window_page.total_pages %}
+          <a rel="next" data-testid="window-page-next"
+             href="{{ window_page_url(outcome.run_id, window_page.page + 1, window_page.page_size, window_page.kind) }}">下一页</a>
+        {% else %}
+          <span class="disabled">下一页</span>
+        {% endif %}
+        <label class="page-size">每页
+          <select data-testid="window-page-size"
+                  onchange="location.href='/r/{{ outcome.run_id }}?wsize='+this.value+'{% if window_page.kind %}&wkind={{ window_page.kind }}{% endif %}#window-panel'">
+            {% for z in [20, 50, 100, 200] %}
+            <option value="{{ z }}" {{ 'selected' if window_page.page_size == z }}>{{ z }}</option>
+            {% endfor %}
+          </select>
+          段
+        </label>
+      </nav>
+      {% endif %}
+    {% endif %}
+
+    <details class="win-method">
+      <summary>判定方法与序号/跨度明细</summary>
+      <ul class="win-method-list">
+        <li>从第 {{ w.handshake_ack_frame }} 帧握手完成开始按帧序回放，支持 32 位序号回绕。</li>
+        <li>以 SYN-ACK 窗口原值 <code>{{ w.initial_window_raw }}</code> 为初值；
+          {% if w.wscale_negotiated %}
+            SYN 与 SYN-ACK 均携带 Window Scale，握手后接收方通告按 ×2^{{ w.window_shift }} 换算。
+          {% else %}
+            未在 SYN 与 SYN-ACK 中同时见到 Window Scale，握手后的窗口通告按原值使用。
+          {% endif %}
+        </li>
+        <li>按 RFC 9293 的 <code>SND.UNA &lt; SEG.ACK ≤ SND.NXT</code> 更新累计确认；
+          窗宽更新还需 <code>SND.UNA ≤ SEG.ACK ≤ SND.NXT</code> 且满足
+          <code>SND.WL1 &lt; SEG.SEQ</code> 或
+          <code>SND.WL1 = SEG.SEQ 且 SND.WL2 ≤ SEG.ACK</code>。</li>
+        <li>新发额度 = 累计 ACK + 有效窗宽 − 已发数据最远右沿；重传旧字节不推进最远右沿。</li>
+        <li>双向数据跨度：发起方 {{ '{:,}'.format(w.client_span) }} 字节 /
+          接收方 {{ '{:,}'.format(w.server_span) }} 字节（上限 {{ '{:,}'.format(2147483648) }}）。</li>
+        <li>机器可读：<a href="/api/r/{{ outcome.run_id }}/windows">/api/r/{{ outcome.run_id }}/windows</a>。</li>
+      </ul>
+    </details>
+  {% endif %}
+</section>

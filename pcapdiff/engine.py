@@ -40,6 +40,14 @@ from .scanner import (
     format_tuple,
     scan_capture,
 )
+from .window_check import (
+    KIND_LABELS as WINDOW_KIND_LABELS,
+)
+from .window_check import (
+    TERMINAL_REASONS as WINDOW_TERMINAL_REASONS,
+)
+from .window_check import WindowEpisode, WindowReport, analyze_window
+from .window_check import analyze_window_exhaustion  # re-exported alias
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 10000
@@ -92,6 +100,7 @@ class AnalysisOutcome:
     receiver_report: Optional[dict] = None
     meta: dict = field(default_factory=dict)
     summary: dict = field(default_factory=dict)
+    window: Optional[dict] = None
 
     def to_jsonable(self) -> dict:
         return {
@@ -102,6 +111,7 @@ class AnalysisOutcome:
             "receiver": self.receiver_report,
             "meta": self.meta,
             "summary": self.summary,
+            "window": self.window,
         }
 
 
@@ -217,6 +227,19 @@ def _init_db(conn: sqlite3.Connection) -> None:
         "idx INTEGER PRIMARY KEY, start INTEGER NOT NULL, "
         "\"end\" INTEGER NOT NULL, bytes INTEGER NOT NULL, "
         "cat TEXT NOT NULL)"
+    )
+    # Receive-window exhaustion episodes (streamed from the sender PCAP once,
+    # paginated forever without re-reading the capture).
+    conn.execute(
+        "CREATE TABLE win_episode ("
+        "idx INTEGER PRIMARY KEY, kind TEXT NOT NULL, "
+        "start_frame INTEGER NOT NULL, end_frame INTEGER NOT NULL, "
+        "start_ts_ns INTEGER NOT NULL, end_ts_ns INTEGER NOT NULL, "
+        "duration_ns INTEGER NOT NULL, recovered INTEGER NOT NULL, "
+        "end_reason TEXT NOT NULL, start_quota INTEGER NOT NULL DEFAULT 0, "
+        "end_quota INTEGER NOT NULL DEFAULT 0, "
+        "start_window INTEGER NOT NULL DEFAULT 0, "
+        "end_window INTEGER NOT NULL DEFAULT 0)"
     )
     conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
     conn.commit()
@@ -464,6 +487,145 @@ def _loads(v: str):
 
 
 # ---------------------------------------------------------------------------
+# Receive-window exhaustion storage / pagination
+# ---------------------------------------------------------------------------
+
+class SQLiteEpisodeSink:
+    """Batched episode writer; Python holds at most ~1000 rows."""
+
+    FLUSH_AT = 1000
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self.batch: list[tuple] = []
+
+    def emit(self, ep: WindowEpisode) -> None:
+        self.batch.append((
+            ep.idx, ep.kind, ep.start_frame, ep.end_frame,
+            ep.start_ts_ns, ep.end_ts_ns, ep.duration_ns,
+            1 if ep.recovered else 0, ep.end_reason,
+            ep.start_quota, ep.end_quota,
+            ep.start_window, ep.end_window,
+        ))
+        if len(self.batch) >= self.FLUSH_AT:
+            self.flush()
+
+    def flush(self) -> None:
+        if self.batch:
+            self.conn.executemany(
+                "INSERT INTO win_episode(idx, kind, start_frame, end_frame,"
+                " start_ts_ns, end_ts_ns, duration_ns, recovered, end_reason,"
+                " start_quota, end_quota, start_window, end_window)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                self.batch,
+            )
+            self.conn.commit()
+            self.batch.clear()
+
+    def discard(self) -> None:
+        self.batch.clear()
+        self.conn.execute("DELETE FROM win_episode")
+        self.conn.commit()
+
+
+def _duration_text(duration_ns: int) -> str:
+    if duration_ns < 1_000:
+        return "0 秒"
+    if duration_ns < 1_000_000_000:
+        ms = duration_ns / 1_000_000
+        if abs(ms - round(ms)) < 0.05:
+            return f"{round(ms)} 毫秒"
+        return f"{ms:.1f} 毫秒"
+    return f"{duration_ns / 1_000_000_000:.3f} 秒"
+
+
+def win_table_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table'"
+        " AND name='win_episode'"
+    ).fetchone() is not None
+
+
+def get_window_page(
+    run_dir: str,
+    page: int = 1,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    kind: Optional[str] = None,
+) -> dict:
+    """Paginate stored window episodes without touching the PCAP."""
+    page_size = max(1, min(int(page_size or DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE))
+    page = max(1, int(page or 1))
+    empty = {
+        "items": [], "page": 1, "page_size": page_size,
+        "total_pages": 1, "total_episodes": 0, "kind": kind or "",
+        "kind_labels": WINDOW_KIND_LABELS,
+    }
+    path = db_path(run_dir)
+    if not os.path.exists(path):
+        return empty
+    conn = _connect(path)
+    try:
+        if not win_table_exists(conn):
+            return empty
+        where = ""
+        params_count: tuple = ()
+        if kind in WINDOW_KIND_LABELS:
+            where = "WHERE kind = ?"
+            params_count = (kind,)
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM win_episode {where}", params_count
+        ).fetchone()[0]
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, total_pages)
+        offset = (page - 1) * page_size
+        rows = conn.execute(
+            "SELECT idx, kind, start_frame, end_frame, start_ts_ns,"
+            " end_ts_ns, duration_ns, recovered, end_reason,"
+            " start_quota, end_quota, start_window, end_window"
+            " FROM win_episode " + where +
+            " ORDER BY idx LIMIT ? OFFSET ?",
+            (*params_count, page_size, offset),
+        ).fetchall()
+        items = []
+        for (idx, k, sf, ef, sts, ets, dur, rec, reason,
+             sq, eq, sw, ew) in rows:
+            items.append({
+                "idx": idx,
+                "kind": k,
+                "kind_label": WINDOW_KIND_LABELS.get(k, k),
+                "start_frame": sf,
+                "end_frame": ef,
+                "start_frame_no": sf,
+                "end_frame_no": ef,
+                "start_ts_ns": sts,
+                "end_ts_ns": ets,
+                "duration_ns": dur,
+                "duration_ms": round(dur / 1_000_000, 3),
+                "duration_sec": round(dur / 1_000_000_000, 6),
+                "elapsed_sec": round(dur / 1_000_000_000, 6),
+                "duration_text": _duration_text(dur),
+                "recovered": bool(rec),
+                "end_reason": reason,
+                "unrecovered": reason in WINDOW_TERMINAL_REASONS,
+                "start_quota": sq,
+                "end_quota": eq,
+                "start_window": sw,
+                "end_window": ew,
+            })
+        return {
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "total_episodes": total,
+            "kind": kind or "",
+            "kind_labels": WINDOW_KIND_LABELS,
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
 
@@ -507,19 +669,53 @@ def run_analysis(
     if s_scan.readable and r_scan.readable and s_scan.syns and r_scan.syns:
         chosen = _choose_connection(s_scan, r_scan, errors)
 
-    if errors or chosen is None:
-        outcome.ok = False
-        outcome.errors = errors or ["校验未通过，未进行比对。"]
-        _write_report_json(outcome)
-        return outcome
-
-    # Pass 2 — extract ranges into SQLite.
+    # The run DB (including the window-episode table) exists even when the
+    # byte comparison fails validation, so the sender-only window check can
+    # still render/paginate its result.
     db_file = db_path(run_dir)
     if os.path.exists(db_file):
         os.remove(db_file)
     conn = _connect(db_file)
     _init_db(conn)
 
+    win_tuple = chosen.tuple4 if chosen is not None else None
+    win_isn = chosen.isn if chosen is not None else None
+    if win_tuple is None and len(s_scan.syns) == 1:
+        only_syn = s_scan.syns[0]
+        win_tuple, win_isn = only_syn.tuple4, only_syn.isn
+
+    win_sink = SQLiteEpisodeSink(conn)
+    try:
+        win_report = analyze_window(
+            sender_path, win_tuple, win_isn,
+            sink=win_sink, display_name=sender_name,
+        )
+        win_sink.flush()
+        if not win_report.applicable:
+            win_sink.discard()
+    except Exception as exc:  # defensive: side check never breaks comparison
+        win_sink.discard()
+        win_report = WindowReport(
+            applicable=False,
+            status="error",
+            display_name=sender_name,
+            reasons=[f"接收窗口耗尽检查执行失败：{type(exc).__name__}: {exc}"],
+        )
+    outcome.window = win_report.to_dict(include_episodes=False)
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(k, v) VALUES ('window_obj', ?)",
+        (json.dumps(outcome.window, ensure_ascii=False),),
+    )
+    conn.commit()
+
+    if errors or chosen is None:
+        conn.close()
+        outcome.ok = False
+        outcome.errors = errors or ["校验未通过，未进行比对。"]
+        _write_report_json(outcome)
+        return outcome
+
+    # Pass 2 — extract ranges into SQLite.
     s_extract = extract_ranges(
         sender_path, chosen.tuple4, chosen.isn, "s_raw", conn
     )
@@ -629,4 +825,5 @@ def load_outcome(run_dir: str, run_id: str) -> Optional[AnalysisOutcome]:
         receiver_report=data.get("receiver"),
         meta=data.get("meta", {}),
         summary=data.get("summary", {}),
+        window=data.get("window"),
     )

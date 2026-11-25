@@ -21,6 +21,7 @@ from .engine import (
     create_run_dir,
     default_var_dir,
     get_page,
+    get_window_page,
     load_outcome,
     run_analysis,
 )
@@ -73,6 +74,37 @@ def _pagination_args() -> tuple[int, int, str | None]:
         values.get("cat") or values.get("category") or values.get("type")
     )
     return max(1, page), size, category
+
+
+def _window_pagination_args() -> tuple[int, int, str | None]:
+    values = request.values
+    try:
+        page = int(values.get(
+            "wpage", values.get("wp", values.get("window_page", 1))
+        ))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = int(values.get(
+            "wsize",
+            values.get("wpage_size",
+                       values.get("wper_page",
+                                  values.get("wlimit", DEFAULT_PAGE_SIZE))),
+        ))
+    except (TypeError, ValueError):
+        size = DEFAULT_PAGE_SIZE
+    kind = (values.get("wkind") or values.get("wcat") or "").strip().lower()
+    if kind not in ("zero", "full"):
+        kind = None
+    return max(1, page), size, kind
+
+
+def _safe_window_page(run_dir: str):
+    wpage, wsize, wkind = _window_pagination_args()
+    try:
+        return get_window_page(run_dir, wpage, wsize, wkind)
+    except Exception:
+        return None
 
 SENDER_FIELDS = ("sender", "sender_file", "send", "file1", "a", "left")
 RECEIVER_FIELDS = ("receiver", "receiver_file", "recv", "receive",
@@ -243,6 +275,7 @@ def create_app(var_dir: str | None = None) -> Flask:
                 "result.html",
                 outcome=outcome,
                 page_data=None,
+                window_page=_safe_window_page(outcome.run_dir),
                 categories=CATEGORY_LABELS,
                 version=__version__,
             ), 200
@@ -252,6 +285,7 @@ def create_app(var_dir: str | None = None) -> Flask:
             "result.html",
             outcome=outcome,
             page_data=page_data,
+            window_page=_safe_window_page(outcome.run_dir),
             categories=CATEGORY_LABELS,
             version=__version__,
         ), 200
@@ -262,11 +296,14 @@ def create_app(var_dir: str | None = None) -> Flask:
             return jsonify(ok=False, errors=["需要两个 PCAP 文件：sender 与 receiver"]), 400
         outcome = _save_and_analyze(sender_fs, receiver_fs)
         if not outcome.ok:
-            return jsonify(outcome.to_jsonable()), 400
+            payload = outcome.to_jsonable()
+            payload["window_page"] = _safe_window_page(outcome.run_dir)
+            return jsonify(payload), 400
         page, size, category = _pagination_args()
         page_data = get_page(outcome.run_dir, page, size, category)
         payload = outcome.to_jsonable()
         payload["page"] = page_data
+        payload["window_page"] = _safe_window_page(outcome.run_dir)
         return jsonify(payload), 200
 
     @app.get("/sample/<sample_key>")
@@ -287,10 +324,12 @@ def create_app(var_dir: str | None = None) -> Flask:
             payload = outcome.to_jsonable()
             if outcome.ok:
                 payload["page"] = get_page(run_dir, 1, DEFAULT_PAGE_SIZE)
+            payload["window_page"] = _safe_window_page(run_dir)
             return jsonify(payload)
         if not outcome.ok:
             return render_template(
                 "result.html", outcome=outcome, page_data=None,
+                window_page=_safe_window_page(run_dir),
                 categories=CATEGORY_LABELS, version=__version__,
             ), 200
         from flask import redirect
@@ -316,6 +355,7 @@ def create_app(var_dir: str | None = None) -> Flask:
         if outcome.ok:
             page, size, category = _pagination_args()
             payload["page"] = get_page(run_dir, page, size, category)
+        payload["window_page"] = _safe_window_page(run_dir)
         return jsonify(payload), 200 if outcome.ok else 400
 
     @app.get("/r/<run_id>")
@@ -341,6 +381,7 @@ def create_app(var_dir: str | None = None) -> Flask:
         if not outcome.ok:
             return render_template(
                 "result.html", outcome=outcome, page_data=None,
+                window_page=_safe_window_page(run_dir),
                 categories=CATEGORY_LABELS, version=__version__,
             )
         page, size, category = _pagination_args()
@@ -349,6 +390,7 @@ def create_app(var_dir: str | None = None) -> Flask:
             "result.html",
             outcome=outcome,
             page_data=page_data,
+            window_page=_safe_window_page(run_dir),
             categories=CATEGORY_LABELS,
             version=__version__,
         )
@@ -361,13 +403,28 @@ def create_app(var_dir: str | None = None) -> Flask:
         outcome = load_outcome(run_dir, run_id)
         if outcome is None:
             abort(404)
-        if not outcome.ok:
-            return jsonify(outcome.to_jsonable()), 400
         page, size, category = _pagination_args()
-        page_data = get_page(run_dir, page, size, category)
         payload = outcome.to_jsonable()
-        payload["page"] = page_data
-        return jsonify(payload)
+        if outcome.ok:
+            page_data = get_page(run_dir, page, size, category)
+            payload["page"] = page_data
+        payload["window_page"] = _safe_window_page(run_dir)
+        return jsonify(payload), 200 if outcome.ok else 400
+
+    @app.get("/api/r/<run_id>/windows")
+    def result_windows_api(run_id: str):
+        if not RUN_ID_RE.match(run_id):
+            abort(404)
+        run_dir = os.path.join(app.config["VAR_DIR"], "runs", run_id)
+        outcome = load_outcome(run_dir, run_id)
+        if outcome is None:
+            abort(404)
+        wpage, wsize, wkind = _window_pagination_args()
+        return jsonify({
+            "run_id": run_id,
+            "window": outcome.window,
+            "window_page": get_window_page(run_dir, wpage, wsize, wkind),
+        })
 
     @app.get("/r/<run_id>/download/<which>")
     def download_pcap(run_id: str, which: str):

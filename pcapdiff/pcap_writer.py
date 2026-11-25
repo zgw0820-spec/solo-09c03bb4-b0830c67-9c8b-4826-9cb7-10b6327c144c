@@ -31,24 +31,29 @@ def build_tcp_packet(
     identification: int = 1,
     mtu_payload_cap: int | None = None,
     frag_bits: int = 0,
+    window: int = 65535,
+    options: bytes = b"",
 ) -> bytes:
     """Build a full Ethernet frame (without checksums, which are allowed 0)."""
     src_b = ipv4_bytes(src_ip)
     dst_b = ipv4_bytes(dst_ip)
 
-    tcp_hdr_no_opts = struct.pack(
+    # TCP options are padded with zero (EOL) bytes to a 4-byte boundary.
+    opt_padded = options + b"\x00" * ((-len(options)) % 4)
+    data_offset_words = (20 + len(opt_padded)) // 4
+    tcp_hdr = struct.pack(
         "!HHIIBBHHH",
         src_port,
         dst_port,
         seq & 0xFFFFFFFF,
         ack & 0xFFFFFFFF,
-        (5 << 4),          # data offset 5 (20 bytes)
+        (data_offset_words << 4),  # data offset / reserved nibble
         flags,
-        65535,             # window
+        window & 0xFFFF,
         0,                 # checksum (not validated by pcapdiff)
         0,                 # urgent pointer
     )
-    tcp_segment = tcp_hdr_no_opts + payload
+    tcp_segment = tcp_hdr + opt_padded + payload
 
     total_len = 20 + len(tcp_segment)
     ip_hdr = struct.pack(
@@ -101,12 +106,38 @@ def write_classic_pcap(
     ts = 1_700_000_000
     with open(path, "wb") as fh:
         fh.write(ghdr)
-        for frame in frames:
-            fh.write(struct.pack(e + "IIII", ts, count * 1000,
+        for item in frames:
+            # Optional per-frame timestamp: item may be (frame_bytes,
+            # epoch_seconds_float).  Plain bytes get deterministic synthetic
+            # timestamps one second + one millisecond apart.
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and isinstance(item[0], (bytes, bytearray))
+                and isinstance(item[1], (int, float))
+            ):
+                frame = bytes(item[0])
+                ts_float = float(item[1])
+                ts_sec = int(ts_float)
+                ts_usec = int(round((ts_float - ts_sec) * 1_000_000))
+                if ts_usec >= 1_000_000:
+                    ts_sec += 1
+                    ts_usec -= 1_000_000
+            else:
+                frame = bytes(item)
+                ts_sec = ts
+                ts_usec = count * 1000
+            fh.write(struct.pack(e + "IIII", ts_sec, ts_usec,
                                  len(frame), len(frame)))
             fh.write(frame)
             count += 1
-            ts += 1
+            if not (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and isinstance(item[1], (int, float))
+                and isinstance(item[0], (bytes, bytearray))
+            ):
+                ts += 1
     return count
 
 
