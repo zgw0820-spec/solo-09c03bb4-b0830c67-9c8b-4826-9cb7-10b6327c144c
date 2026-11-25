@@ -1,0 +1,200 @@
+{% extends "base.html" %}
+{% block title %}比对结果 · 双端 TCP 证据比对{% endblock %}
+
+{% macro page_url(p, run_id, size, cat) -%}
+/r/{{ run_id }}?page={{ p }}&size={{ size }}{% if cat %}&cat={{ cat }}{% endif %}
+{%- endmacro %}
+
+{% block content %}
+
+{% if not outcome.ok %}
+<section class="card error-card" data-testid="validation-failed">
+  <h1>校验未通过，未生成比对结果</h1>
+  <ul class="error-list" data-testid="validation-errors">
+    {% for e in outcome.errors %}
+    <li>{{ e }}</li>
+    {% endfor %}
+  </ul>
+
+  <div class="report-grid">
+    {% for rep in [outcome.sender_report, outcome.receiver_report] if rep %}
+    <div class="report report-{{ rep.role }}">
+      <h3>{{ '发端文件' if rep.role == 'sender' else '收端文件' }}：{{ rep.display_name }}</h3>
+      <table class="kv">
+        <tr><th>是否可解析</th><td>{{ '是' if rep.readable else '否' }}</td></tr>
+        {% if rep.format_name %}<tr><th>格式</th><td>{{ rep.format_name }} / linktype {{ rep.linktype }}</td></tr>{% endif %}
+        <tr><th>帧数</th><td>{{ rep.frame_count }}</td></tr>
+        <tr><th>起始 SYN 数</th><td>{{ rep.syns|length }}</td></tr>
+        <tr><th>IP 分片包数</th><td class="{{ 'bad' if rep.fragmented_packets else '' }}">{{ rep.fragmented_packets }}</td></tr>
+        <tr><th>异常包数</th><td>{{ rep.malformed_packets }}</td></tr>
+        <tr><th>截断包数</th><td>{{ rep.truncated_packets }}</td></tr>
+        {% if rep.error %}<tr><th>错误</th><td class="bad">{{ rep.error }}</td></tr>{% endif %}
+      </table>
+      {% if rep.syns %}
+      <details>
+        <summary>起始 SYN 列表</summary>
+        <ul class="syn-list">
+          {% for s in rep.syns %}
+          <li>第 {{ s.frame_no }} 帧 · {{ s.tuple }} · ISN={{ s.isn }} ({{ '0x%08X'|format(s.isn) }})</li>
+          {% endfor %}
+        </ul>
+      </details>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
+  <a class="btn btn-secondary" href="{{ url_for('index') }}">← 返回重新上传</a>
+</section>
+
+{% else %}
+{% set m = outcome.meta %}
+{% set s = outcome.summary %}
+
+<section class="result-head" data-testid="result-page" data-run-id="{{ outcome.run_id }}">
+  <h1>比对结果</h1>
+  <div class="meta-grid">
+    <div><span class="meta-k">连接四元组</span><span class="meta-v">{{ m.tuple }}</span></div>
+    <div><span class="meta-k">起始 SYN / ISN</span><span class="meta-v">{{ m.isn }} · {{ m.isn_hex }}</span></div>
+    <div><span class="meta-k">最大累计 ACK 边界</span>
+      <span class="meta-v" data-testid="ack-boundary">{{ m.ack_boundary }} 字节</span></div>
+    <div><span class="meta-k">发端数据跨度</span><span class="meta-v">{{ m.sender_span }} 字节（上限 {{ m.span_limit }}）</span></div>
+  </div>
+</section>
+
+<section class="summary-cards" data-testid="summary">
+  <div class="sum-card sum-total">
+    <div class="sum-label">发端所见字节总数</div>
+    <div class="sum-num" data-testid="sum-total-bytes">{{ '{:,}'.format(s.total_bytes) }}</div>
+    <div class="sum-sub">合并后区间 {{ s.total_ranges }} 段</div>
+  </div>
+  {% for key in ['captured', 'acked_only', 'missing'] %}
+  {% set c = s.categories[key] %}
+  <a class="sum-card sum-{{ key }} {{ 'active' if page_data.category == key }}"
+     href="/r/{{ outcome.run_id }}?cat={{ key }}&size={{ page_data.page_size }}"
+     data-testid="summary-{{ key }}">
+    <div class="sum-label"><span class="dot dot-{{ key }}"></span>{{ c.label }}</div>
+    <div class="sum-num" data-testid="bytes-{{ key }}">{{ '{:,}'.format(c.bytes) }}</div>
+    <div class="sum-sub">{{ c.ranges }} 段 · {{ c.percent }}%</div>
+  </a>
+  {% endfor %}
+</section>
+
+<section class="card table-card">
+  <div class="table-toolbar">
+    <h2>偏移区间（同类相邻已合并）</h2>
+    <div class="toolbar-right">
+      {% if page_data.category %}
+      <a class="btn btn-mini" href="/r/{{ outcome.run_id }}?size={{ page_data.page_size }}">清除分类筛选：{{ categories[page_data.category] }} ✕</a>
+      {% endif %}
+      <label class="page-size">每页
+        <select data-testid="page-size" onchange="location.href='/r/{{ outcome.run_id }}?size='+this.value{% if page_data.category %}+'&cat={{ page_data.category }}'{% endif %}">
+          {% for z in [20, 50, 100, 200] %}
+          <option value="{{ z }}" {{ 'selected' if page_data.page_size == z }}>{{ z }}</option>
+          {% endfor %}
+        </select>
+        段
+      </label>
+    </div>
+  </div>
+
+  <div class="table-scroll">
+    <table class="seg-table" data-testid="segment-table">
+      <thead>
+        <tr>
+          <th class="col-idx">#</th>
+          <th>字节偏移区间（0 起，含首尾；附 SYN 相对序号）</th>
+          <th>十六进制</th>
+          <th class="col-len">长度</th>
+          <th>证据分类</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for it in page_data['items'] %}
+        <tr class="segment-row cat-{{ it.category }}"
+            data-testid="segment-row"
+            data-category="{{ it.category }}"
+            data-start="{{ it.start }}"
+            data-end="{{ it.end }}"
+            data-last="{{ it.last }}"
+            data-offset-start="{{ it.start }}"
+            data-offset-end="{{ it.end }}"
+            data-seq-start="{{ it.seq_start }}"
+            data-seq-last="{{ it.seq_last }}">
+          <td class="col-idx">{{ it.idx + 1 }}</td>
+          <td class="range-dec">
+            <code class="range-ascii" data-testid="range-ascii">{{ it.start }}-{{ it.last }}</code>
+            <span class="range-full">{{ '{:,}'.format(it.start) }} – {{ '{:,}'.format(it.last) }}</span>
+            <span class="range-seq" data-testid="range-seq"
+                  title="Wireshark 风格相对序号：SYN=0，首个数据字节=1">
+              SYN 相对序号 {{ it.seq_start }}–{{ it.seq_last }}
+            </span>
+          </td>
+          <td class="range-hex">0x{{ '%08X'|format(it.start) }} – 0x{{ '%08X'|format(it.last) }}</td>
+          <td class="col-len">{{ '{:,}'.format(it.length) }}</td>
+          <td><span class="badge badge-{{ it.category }}">{{ it.label }}</span></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="empty">当前筛选下没有区间。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if page_data.total_pages > 1 %}
+  <nav class="pagination" data-testid="pagination" aria-label="分页">
+    {% if page_data.page > 1 %}
+      <a rel="first" data-testid="page-first" href="{{ page_url(1, outcome.run_id, page_data.page_size, page_data.category) }}">首页</a>
+      <a rel="prev" data-testid="page-prev" href="{{ page_url(page_data.page - 1, outcome.run_id, page_data.page_size, page_data.category) }}">上一页</a>
+    {% else %}
+      <span class="disabled">首页</span><span class="disabled">上一页</span>
+    {% endif %}
+
+    <span class="page-info" data-testid="page-info">
+      第 <strong>{{ page_data.page }}</strong> / {{ page_data.total_pages }} 页
+      · 共 {{ page_data.total_ranges }} 段
+    </span>
+
+    {% if page_data.page < page_data.total_pages %}
+      <a rel="next" data-testid="page-next" href="{{ page_url(page_data.page + 1, outcome.run_id, page_data.page_size, page_data.category) }}">下一页</a>
+      <a rel="last" data-testid="page-last" href="{{ page_url(page_data.total_pages, outcome.run_id, page_data.page_size, page_data.category) }}">末页</a>
+    {% else %}
+      <span class="disabled">下一页</span><span class="disabled">末页</span>
+    {% endif %}
+  </nav>
+  {% endif %}
+</section>
+
+<details class="card diagnostics">
+  <summary>解析与校验明细</summary>
+  <div class="report-grid">
+    {% for rep in [outcome.sender_report, outcome.receiver_report] if rep %}
+    <div class="report report-{{ rep.role }}">
+      <h3>{{ '发端' if rep.role == 'sender' else '收端' }}：{{ rep.display_name }}</h3>
+      <table class="kv">
+        {% if rep.format_name %}<tr><th>格式</th><td>{{ rep.format_name }} / linktype {{ rep.linktype }}</td></tr>{% endif %}
+        <tr><th>总帧数</th><td>{{ rep.frame_count }}</td></tr>
+        <tr><th>IP 分片包</th><td>{{ rep.fragmented_packets }}</td></tr>
+        <tr><th>异常包</th><td>{{ rep.malformed_packets }}</td></tr>
+        <tr><th>截断包</th><td>{{ rep.truncated_packets }}</td></tr>
+      </table>
+    </div>
+    {% endfor %}
+  </div>
+  <table class="kv kv-wide">
+    <tr><th>发端正向数据包 / 载荷次数</th><td>{{ m.sender_fwd_data_packets }}</td></tr>
+    <tr><th>收端正向数据包</th><td>{{ m.receiver_fwd_data_packets }}</td></tr>
+    <tr><th>发端文件中反向 ACK 数 / ACK 边界</th><td>{{ m.sender_reverse_ack_packets }} / {{ m.ack_boundary_from_sender_file }}</td></tr>
+    <tr><th>收端文件中反向 ACK 数 / ACK 边界</th><td>{{ m.receiver_reverse_ack_packets }} / {{ m.ack_boundary_from_receiver_file }}</td></tr>
+    <tr><th>发端合并后区间数</th><td>{{ m.sender_union_intervals }}</td></tr>
+    <tr><th>收端合并后区间数</th><td>{{ m.receiver_union_intervals }}</td></tr>
+  </table>
+  <p class="form-hint">
+    机器可读结果：<a href="{{ url_for('result_api', run_id=outcome.run_id) }}">/api/r/{{ outcome.run_id }}</a>
+  </p>
+</details>
+
+<p class="back-row"><a class="btn btn-secondary" href="{{ url_for('index') }}">← 新的比对</a></p>
+{% endif %}
+
+{% endblock %}

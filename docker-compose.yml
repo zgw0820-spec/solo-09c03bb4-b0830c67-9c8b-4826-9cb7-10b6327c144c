@@ -1,0 +1,22 @@
+services:
+  pcapdiff:
+    build: .
+    image: pcapdiff:latest
+    container_name: pcapdiff-web
+    ports:
+      # Flask/Gunicorn listens on 5000 inside the container.  Publish on the
+      # Flask-default 5000 and on the common 8000 alternative so either
+      # convention works.  Override the primary with WEB_PORT, e.g.
+      #   WEB_PORT=8080 docker compose up
+      - "${WEB_PORT:-5000}:5000"
+      - "8000:5000"
+    environment:
+      PCAPDIFF_VAR_DIR: /data
+      # Reject absurd uploads; default 8 GiB. Override as needed.
+      PCAPDIFF_MAX_UPLOAD: "${PCAPDIFF_MAX_UPLOAD:-8589934592}"
+    volumes:
+      - pcapdiff-data:/data
+    restart: unless-stopped
+
+volumes:
+  pcapdiff-data:

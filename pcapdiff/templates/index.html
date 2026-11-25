@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="hero">
+  <h1>哪些 TCP 字节缺少到达证据？</h1>
+  <p class="lead">
+    上传同一条 IPv4 TCP 连接在<strong>发端</strong>与<strong>收端</strong>录制的
+    Ethernet PCAP。工具按起始 SYN 对齐发起方数据的字节偏移，自动处理序号回绕、
+    重传与两端分段差异，把发端见过的每个字节分为三类，并合并同类相邻区间。
+  </p>
+</section>
+
+{% if form_error %}
+<div class="alert alert-error" data-testid="form-error">{{ form_error }}</div>
+{% endif %}
+
+<section class="grid-two">
+  <form class="card upload-form" method="post" action="{{ url_for('upload_analyze') }}"
+        enctype="multipart/form-data" data-testid="upload-form">
+    <h2>上传双端抓包</h2>
+
+    <label class="file-field">
+      <span class="file-label">① 发端 PCAP（看到所有已发送字节）</span>
+      <input type="file" name="sender" accept=".pcap,.cap,.pcapng" required
+             data-testid="input-sender">
+    </label>
+
+    <label class="file-field">
+      <span class="file-label">② 收端 PCAP（收到的数据包 / 发出的累计 ACK）</span>
+      <input type="file" name="receiver" accept=".pcap,.cap,.pcapng" required
+             data-testid="input-receiver">
+    </label>
+
+    <button type="submit" class="btn btn-primary" data-testid="submit-analyze">
+      开始校验并比对
+    </button>
+
+    <p class="form-hint">
+      两份抓包都通过校验后才会给出比对结果；任一文件缺少起始 SYN、存在 IP 分片
+      或发起方数据跨度 ≥ 2 GiB 时，会分别说明原因。
+    </p>
+  </form>
+
+  <div class="card sample-card">
+    <h2>没有文件？用内置样例试跑</h2>
+    <p>样例 PCAP 由程序现场生成，覆盖三类证据、重传与不同分段。</p>
+    <a class="btn btn-primary sample-cta"
+       href="{{ url_for('sample_run', sample_key='basic') }}"
+       data-testid="try-builtin-sample" id="try-sample">
+      🚀 使用内置样例一键试跑
+    </a>
+    <div class="sample-list">
+    {% for key, s in samples.items() %}
+    <a class="sample-item" href="{{ url_for('sample_run', sample_key=key) }}"
+       data-testid="sample-{{ key }}">
+      <span class="sample-title">▶ {{ s.title }}</span>
+      <span class="sample-desc">{{ s.description }}</span>
+    </a>
+    {% endfor %}
+    </div>
+  </div>
+</section>
+
+<section class="card rules-card">
+  <h2>判定规则</h2>
+  <ol class="rules">
+    <li><span class="dot dot-captured"></span><strong>收端抓到数据包</strong>：
+      该偏移区间出现在收端抓包的发起方→接收方 TCP 载荷中（分段不同也能按区间重合识别）。</li>
+    <li><span class="dot dot-acked"></span><strong>仅被收端累计 ACK 确认</strong>：
+      收端抓包没有直接抓到对应数据，但收端→发端的累计 ACK 已覆盖该偏移
+      （取两份抓包中观察到的最大累计 ACK 边界）。</li>
+    <li><span class="dot dot-missing"></span><strong>收端无证据</strong>：
+      既无收端数据包，也未被累计 ACK 覆盖。</li>
+  </ol>
+  <p class="form-hint">
+    校验要求：Ethernet 封装（DLT_EN10MB）的经典 PCAP 或 PCAPNG；两份均含同一连接、
+    同一 ISN 的起始 SYN（SYN=1, ACK=0）；无任何 IPv4 分片；发起方数据跨度严格小于 2 GiB。
+  </p>
+</section>
+
+{% endblock %}

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}双端 TCP 抓包字节证据比对{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <a class="brand" href="{{ url_for('index') }}">
+      <span class="brand-mark">⇄</span>
+      双端 TCP 字节证据比对
+    </a>
+    <span class="brand-sub">备份专线割接 · 到达证据核查 · v{{ version }}</span>
+  </div>
+</header>
+
+<main class="wrap">
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="wrap footer">
+  <span>流式解析 PCAP / PCAPNG，比对工作内存不随包数增长；区间数据落盘 SQLite 并分页展示。</span>
+</footer>
+</body>
+</html>
